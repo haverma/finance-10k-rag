@@ -6,6 +6,7 @@ requires-python = ">=3.10"
 dependencies = [
   "chromadb>=1.0.0",
   "ollama>=0.6.0",
+  "pymupdf>=1.25.0",
 ]
 
 [project.scripts]
