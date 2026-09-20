@@ -14,7 +14,7 @@ This project is for learning and research, not investment advice. Answers are li
 ## Intended architecture
 
 ```text
-SEC 10-K HTML filings
+SEC 10-K HTML/PDF filings
         |
   extraction + chunking
         |
@@ -42,6 +42,33 @@ python app.py "What risks did Apple disclose about supply chains?" --rag --compa
 ```
 
 Both modes use a temperature of `0.0` by default. The `--rag` flag changes application flow: it embeds the question, searches Chroma, adds retrieved excerpts to the model's messages, and prints their sources. `--no-rag` sends the question directly to the same Llama 2 model.
+
+## Batch ingestion
+
+Create a plain-text input file. Each non-comment line consists of a company name followed by either a fiscal year or a local PDF/HTML filing path:
+
+```text
+APPLE 2023
+ORACLE /Users/harsh/Documents/oracle_10k.pdf
+"MICROSOFT CORPORATION" 2023
+```
+
+Run the caller script:
+
+```bash
+.venv/bin/python src/batch_ingest.py companies.txt \
+  --user-agent "Your Name finance-10k-rag your.email@example.com"
+```
+
+For a `COMPANY YEAR` line, it resolves the company through SEC EDGAR, finds the Form 10-K whose **report date** is in that fiscal year, downloads its official primary HTML filing, and indexes it. A supplied local PDF or HTML path is extracted directly and indexed; its fiscal year is inferred from its text when possible.
+
+To restrict SEC results to filings submitted in a particular month, add (for example):
+
+```bash
+--filing-month 3
+```
+
+Use this only when the chosen company actually filed that 10-K in March. `APPLE 2023`, for example, is a fiscal-year request and is not inherently a March filing.
 
 ## Initial technology choices
 

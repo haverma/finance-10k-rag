@@ -5,3 +5,5 @@ __pycache__/
 data/raw/
 data/chroma/
 data/processed/
+*.egg-info/
+.idea/

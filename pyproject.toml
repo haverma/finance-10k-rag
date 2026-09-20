@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "A local RAG versus no-RAG comparison over SEC 10-K filings"
 requires-python = ">=3.10"
 dependencies = [
+  "beautifulsoup4>=4.12.0",
   "chromadb>=1.0.0",
   "ollama>=0.6.0",
   "pymupdf>=1.25.0",
@@ -11,3 +12,5 @@ dependencies = [
 
 [project.scripts]
 finance-rag = "rag_demo:main"
+finance-rag-ingest = "ingest:main"
+finance-rag-batch = "batch_ingest:main"
