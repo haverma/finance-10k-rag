@@ -1,0 +1,12 @@
+[project]
+name = "finance-10k-rag"
+version = "0.1.0"
+description = "A local RAG versus no-RAG comparison over SEC 10-K filings"
+requires-python = ">=3.10"
+dependencies = [
+  "chromadb>=1.0.0",
+  "ollama>=0.6.0",
+]
+
+[project.scripts]
+finance-rag = "rag_demo:main"
