@@ -43,6 +43,8 @@ python app.py "What risks did Apple disclose about supply chains?" --rag --compa
 
 Both modes use a temperature of `0.0` by default. The `--rag` flag changes application flow: it embeds the question, searches Chroma, adds retrieved excerpts to the model's messages, and prints their sources. `--no-rag` sends the question directly to the same Llama 2 model.
 
+Retrieval is hybrid: Chroma uses cosine similarity for semantic candidates, while the application boosts chunks containing exact question terms and phrases. This makes terms such as `diluted earnings per share` and `supply chain` more reliable than vector-only search. Add `--show-scores` to inspect the cosine, lexical, and combined score for each retrieved source.
+
 ## Batch ingestion
 
 Create a plain-text input file. Each non-comment line consists of a company name followed by either a fiscal year or a local PDF/HTML filing path:

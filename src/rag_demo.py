@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -24,6 +25,9 @@ class RetrievedPassage:
     text: str
     metadata: dict[str, Any]
     distance: float | None
+    vector_score: float
+    lexical_score: float
+    hybrid_score: float
 
 
 def get_collection() -> chromadb.Collection:
@@ -31,12 +35,38 @@ def get_collection() -> chromadb.Collection:
     client = chromadb.PersistentClient(path=str(VECTOR_DB_DIR))
     return client.get_or_create_collection(
         name=COLLECTION_NAME,
-        metadata={"description": "Chunked SEC 10-K filing passages"},
+        metadata={
+            "description": "Chunked SEC 10-K filing passages",
+            "hnsw:space": "cosine",
+        },
     )
 
 
+_STOP_WORDS = {"a", "an", "and", "about", "did", "disclose", "for", "in", "is", "of", "the", "to", "was", "what", "were"}
+
+
+def _lexical_score(question: str, text: str) -> float:
+    """Score exact financial terms and phrases without replacing semantic retrieval."""
+    terms = [term for term in re.findall(r"[a-z0-9]+", question.lower()) if term not in _STOP_WORDS]
+    if not terms:
+        return 0.0
+    normalised_text = " ".join(re.findall(r"[a-z0-9]+", text.lower()))
+    matched_terms = sum(bool(re.search(rf"\b{re.escape(term)}\b", normalised_text)) for term in set(terms))
+    term_score = matched_terms / len(set(terms))
+    phrases = [" ".join(terms[index : index + size]) for size in (2, 3, 4) for index in range(len(terms) - size + 1)]
+    matched_phrase_lengths = [len(phrase.split()) for phrase in phrases if phrase in normalised_text]
+    phrase_score = max(matched_phrase_lengths, default=0) / min(4, len(terms))
+    # A phrase such as "diluted earnings per share" is stronger evidence than four
+    # isolated words scattered across a filing or a table heading.
+    score = 0.35 * term_score + 0.65 * phrase_score
+    metric_phrases = [phrase for phrase in phrases if len(phrase.split()) >= 3]
+    if any(re.search(rf"{re.escape(phrase)}\s*\$?\s*\d", text, flags=re.IGNORECASE) for phrase in metric_phrases):
+        score += 0.20
+    return min(1.0, score)
+
+
 def retrieve(question: str, top_k: int, company: str | None, year: int | None) -> list[RetrievedPassage]:
-    """Embed a question locally and return the most relevant filing passages."""
+    """Hybrid retrieve: cosine similarity plus exact-term matching within filtered chunks."""
     collection = get_collection()
     if collection.count() == 0:
         raise RuntimeError(
@@ -51,18 +81,44 @@ def retrieve(question: str, top_k: int, company: str | None, year: int | None) -
     where = None if not filters else filters[0] if len(filters) == 1 else {"$and": filters}
 
     embedding = ollama.embed(model=DEFAULT_EMBEDDING_MODEL, input=question)["embeddings"][0]
-    result = collection.query(
+    candidate_count = min(max(top_k * 8, 32), collection.count())
+    semantic = collection.query(
         query_embeddings=[embedding],
-        n_results=top_k,
+        n_results=candidate_count,
         where=where,
         include=["documents", "metadatas", "distances"],
     )
-    return [
-        RetrievedPassage(text=document, metadata=metadata, distance=distance)
-        for document, metadata, distance in zip(
-            result["documents"][0], result["metadatas"][0], result["distances"][0]
+    lexical = collection.get(where=where, include=["documents", "metadatas"])
+
+    candidates: dict[str, dict[str, Any]] = {}
+    distances = semantic["distances"][0]
+    for chunk_id, document, metadata, distance in zip(
+        semantic["ids"][0], semantic["documents"][0], semantic["metadatas"][0], distances
+    ):
+        candidates[chunk_id] = {"text": document, "metadata": metadata, "distance": distance}
+    for chunk_id, document, metadata in zip(lexical["ids"], lexical["documents"], lexical["metadatas"]):
+        candidates.setdefault(chunk_id, {"text": document, "metadata": metadata, "distance": None})
+
+    scored: list[RetrievedPassage] = []
+    for candidate in candidates.values():
+        # Chroma cosine distance is 1 - cosine similarity. A missing vector score means the
+        # chunk entered the candidate set through lexical matching alone.
+        vector_score = max(0.0, 1.0 - candidate["distance"]) if candidate["distance"] is not None else 0.0
+        lexical_score = _lexical_score(question, candidate["text"])
+        # Financial tables frequently have weak dense embeddings, so exact term/phrase
+        # evidence receives the larger weight while cosine similarity remains a tie-breaker.
+        hybrid_score = 0.15 * vector_score + 0.85 * lexical_score
+        scored.append(
+            RetrievedPassage(
+                text=candidate["text"],
+                metadata=candidate["metadata"],
+                distance=candidate["distance"],
+                vector_score=vector_score,
+                lexical_score=lexical_score,
+                hybrid_score=hybrid_score,
+            )
         )
-    ]
+    return sorted(scored, key=lambda passage: passage.hybrid_score, reverse=True)[:top_k]
 
 
 def format_context(passages: list[RetrievedPassage]) -> str:
@@ -120,10 +176,16 @@ def ask(args: argparse.Namespace) -> None:
         print("\nRetrieved sources:")
         for index, passage in enumerate(passages, start=1):
             meta = passage.metadata
-            print(
+            source = (
                 f"[{index}] {meta.get('company')} | FY{meta.get('fiscal_year')} | "
                 f"{meta.get('section')} | {meta.get('source_url')}"
             )
+            if args.show_scores:
+                source += (
+                    f" | cosine={passage.vector_score:.3f} "
+                    f"lexical={passage.lexical_score:.3f} hybrid={passage.hybrid_score:.3f}"
+                )
+            print(source)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -137,6 +199,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--top-k", type=int, default=4, help="Number of excerpts to retrieve (default: 4).")
     parser.add_argument("--model", default=DEFAULT_CHAT_MODEL, help=f"Ollama chat model (default: {DEFAULT_CHAT_MODEL}).")
     parser.add_argument("--temperature", type=float, default=0.0, help="Generation temperature (default: 0.0).")
+    parser.add_argument("--show-scores", action="store_true", help="Print cosine, lexical, and combined retrieval scores.")
     return parser
 
 

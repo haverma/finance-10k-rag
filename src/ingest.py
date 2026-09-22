@@ -32,6 +32,7 @@ class TextChunk:
     index: int
     start_char: int
     end_char: int
+    section: str
 
 
 @dataclass(frozen=True)
@@ -77,19 +78,81 @@ def clean_text(raw: str) -> str:
     return re.sub(r"\n{3,}", "\n\n", text).strip()
 
 
-def chunk_text(text: str, chunk_size: int = 1_000, overlap: int = 200) -> list[TextChunk]:
-    """Split cleaned text into overlapping character windows for retrieval."""
+_ITEM_HEADING_RE = re.compile(
+    r"(?im)^\s*(Item\s+(?:1[0-6]|1A|1B|1C|7A|9A|[1-9])[.]?)\s*(.*)$"
+)
+
+
+def _filing_body_start(text: str) -> int:
+    """Skip a table of contents when a filing repeats the Item 1 heading in its body."""
+    matches = list(re.finditer(r"(?im)^\s*Item\s+1[.]?\s*(?:\n\s*)?Business\b", text))
+    return matches[1].start() if len(matches) >= 2 else 0
+
+
+def _sections(text: str) -> list[tuple[str, int, str]]:
+    """Return actual SEC Item sections, avoiding inline references such as 'Item 8 of this Form 10-K'."""
+    body_start = _filing_body_start(text)
+    body = text[body_start:]
+    headings = list(_ITEM_HEADING_RE.finditer(body))
+    if not headings:
+        return [("Unclassified", body_start, body)]
+
+    sections: list[tuple[str, int, str]] = []
+    for index, heading in enumerate(headings):
+        end = headings[index + 1].start() if index + 1 < len(headings) else len(body)
+        item = re.sub(r"\s+", " ", heading.group(1)).strip()
+        title = re.sub(r"\s+", " ", heading.group(2)).strip()
+        label = f"{item} {title}".strip()
+        sections.append((label, body_start + heading.start(), body[heading.start():end].strip()))
+    return sections
+
+
+def _chunk_section(section: str, start_offset: int, text: str, chunk_size: int, overlap: int) -> list[TextChunk]:
+    """Chunk one section without allowing unrelated SEC Items into the same retrieval record."""
+    units = [unit.strip() for unit in re.split(r"(?<=[.!?])\s+(?=[A-Z])", text) if unit.strip()]
+    chunks: list[TextChunk] = []
+    buffer: list[str] = []
+    buffer_length = 0
+    index = 0
+
+    def flush() -> None:
+        nonlocal buffer, buffer_length, index
+        if not buffer:
+            return
+        chunk = " ".join(buffer).strip()
+        if chunk:
+            offset = text.find(chunk)
+            chunks.append(TextChunk(chunk, index, start_offset + max(offset, 0), start_offset + max(offset, 0) + len(chunk), section))
+            index += 1
+        overlap_text = chunk[-overlap:].strip()
+        buffer = [overlap_text] if overlap_text else []
+        buffer_length = len(overlap_text)
+
+    for unit in units:
+        if buffer and buffer_length + len(unit) + 1 > chunk_size:
+            flush()
+        while len(unit) > chunk_size:
+            partial = unit[:chunk_size]
+            chunks.append(TextChunk(partial, index, start_offset + text.find(partial), start_offset + text.find(partial) + len(partial), section))
+            index += 1
+            unit = unit[chunk_size - overlap:]
+        buffer.append(unit)
+        buffer_length += len(unit) + 1
+    flush()
+    return chunks
+
+
+def chunk_text(text: str, chunk_size: int = 1_200, overlap: int = 150) -> list[TextChunk]:
+    """Create overlapping, section-aware chunks suitable for retrieval."""
     if chunk_size <= 0 or overlap < 0 or overlap >= chunk_size:
         raise ValueError("chunk_size must be positive and overlap must be between 0 and chunk_size.")
     chunks: list[TextChunk] = []
-    for index, start in enumerate(range(0, len(text), chunk_size - overlap)):
-        end = min(start + chunk_size, len(text))
-        chunk = text[start:end].strip()
-        if chunk:
-            chunks.append(TextChunk(chunk, index, start, end))
-        if end == len(text):
-            break
-    return chunks
+    for section, start_offset, section_text in _sections(text):
+        chunks.extend(_chunk_section(section, start_offset, section_text, chunk_size, overlap))
+    return [
+        TextChunk(chunk.text, index, chunk.start_char, chunk.end_char, chunk.section)
+        for index, chunk in enumerate(chunks)
+    ]
 
 
 def _sec_get(url: str, user_agent: str) -> bytes:
@@ -169,14 +232,6 @@ def infer_fiscal_year(text: str) -> int:
     return int(match.group(0)[-4:]) if match else 0
 
 
-def _section_at(text: str, offset: int) -> str:
-    """Return the latest SEC Item heading prior to a character offset."""
-    heading = "Unclassified"
-    for match in re.finditer(r"\bITEM\s+(?:1A|1B|1C|[1-9]|1[0-6])[.]?\s*[^\n]{0,120}", text[:offset], flags=re.IGNORECASE):
-        heading = re.sub(r"\s+", " ", match.group(0)).strip()
-    return heading
-
-
 def index_filing(
     company: str,
     ticker: str,
@@ -194,7 +249,13 @@ def index_filing(
 
     source_id = hashlib.sha256(source_url.encode()).hexdigest()
     client = chromadb.PersistentClient(path=str(VECTOR_DB_DIR))
-    collection = client.get_or_create_collection(COLLECTION_NAME, metadata={"description": "Chunked SEC 10-K filing passages"})
+    collection = client.get_or_create_collection(
+        COLLECTION_NAME,
+        metadata={
+            "description": "Chunked SEC 10-K filing passages",
+            "hnsw:space": "cosine",
+        },
+    )
     collection.delete(where={"source_id": source_id})
 
     for start in range(0, len(chunks), 32):
@@ -212,7 +273,7 @@ def index_filing(
                     "fiscal_year": fiscal_year,
                     "filing_date": filing_date,
                     "form": "10-K",
-                    "section": _section_at(text, chunk.start_char),
+                    "section": chunk.section,
                     "source_url": source_url,
                     "source_id": source_id,
                     "chunk_index": chunk.index,
