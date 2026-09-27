@@ -44,6 +44,21 @@ def get_collection() -> chromadb.Collection:
 
 _STOP_WORDS = {"a", "an", "and", "about", "did", "disclose", "for", "in", "is", "of", "the", "to", "was", "what", "were"}
 
+# Common financial acronyms → full phrases found in SEC filings.
+_ACRONYM_EXPANSIONS: dict[str, list[str]] = {
+    "eps": ["earnings per share"],
+    "roi": ["return on investment"],
+    "rnd": ["research and development"],
+    "r&d": ["research and development"],
+    "capex": ["capital expenditure", "capital expenditures"],
+    "opex": ["operating expense", "operating expenses"],
+    "gaap": ["generally accepted accounting principles"],
+    "ebitda": ["earnings before interest taxes depreciation and amortization"],
+    "cogs": ["cost of goods sold", "cost of sales"],
+    "sgna": ["selling general and administrative"],
+    "sg&a": ["selling general and administrative"],
+}
+
 
 def _lexical_score(question: str, text: str) -> float:
     """Score exact financial terms and phrases without replacing semantic retrieval."""
@@ -51,15 +66,31 @@ def _lexical_score(question: str, text: str) -> float:
     if not terms:
         return 0.0
     normalised_text = " ".join(re.findall(r"[a-z0-9]+", text.lower()))
+
+    # Expand known financial acronyms so e.g. "EPS" also matches
+    # "earnings per share" in the filing text.
+    expanded_phrases: list[str] = []
+    for term in terms:
+        for expansion in _ACRONYM_EXPANSIONS.get(term, []):
+            expanded_phrases.append(expansion)
+
     matched_terms = sum(bool(re.search(rf"\b{re.escape(term)}\b", normalised_text)) for term in set(terms))
-    term_score = matched_terms / len(set(terms))
+    # Count acronym expansions found in text as matched terms too.
+    acronym_matches = sum(1 for phrase in expanded_phrases if phrase in normalised_text)
+    matched_terms += acronym_matches
+    term_score = matched_terms / max(len(set(terms)), 1)
+
     phrases = [" ".join(terms[index : index + size]) for size in (2, 3, 4) for index in range(len(terms) - size + 1)]
     matched_phrase_lengths = [len(phrase.split()) for phrase in phrases if phrase in normalised_text]
+    # Expanded acronym phrases count as long phrase matches.
+    matched_phrase_lengths.extend(len(phrase.split()) for phrase in expanded_phrases if phrase in normalised_text)
     phrase_score = max(matched_phrase_lengths, default=0) / min(4, len(terms))
     # A phrase such as "diluted earnings per share" is stronger evidence than four
     # isolated words scattered across a filing or a table heading.
     score = 0.35 * term_score + 0.65 * phrase_score
     metric_phrases = [phrase for phrase in phrases if len(phrase.split()) >= 3]
+    # Also check expanded phrases next to numbers.
+    metric_phrases.extend(expanded_phrases)
     if any(re.search(rf"{re.escape(phrase)}\s*\$?\s*\d", text, flags=re.IGNORECASE) for phrase in metric_phrases):
         score += 0.20
     return min(1.0, score)
@@ -191,9 +222,10 @@ def ask(args: argparse.Namespace) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Compare Llama 2 with and without SEC 10-K RAG.")
     parser.add_argument("question", help="The financial filing question to ask.")
-    mode = parser.add_mutually_exclusive_group(required=True)
-    mode.add_argument("--rag", action="store_true", help="Retrieve 10-K excerpts before answering.")
+    mode = parser.add_mutually_exclusive_group(required=False)
+    mode.add_argument("--rag", action="store_true", help="Retrieve 10-K excerpts before answering (default).")
     mode.add_argument("--no-rag", dest="rag", action="store_false", help="Ask the model without filing retrieval.")
+    parser.set_defaults(rag=True)
     parser.add_argument("--company", help="Optional exact company metadata filter, e.g. Apple Inc.")
     parser.add_argument("--year", type=int, help="Optional fiscal-year metadata filter, e.g. 2024")
     parser.add_argument("--top-k", type=int, default=4, help="Number of excerpts to retrieve (default: 4).")

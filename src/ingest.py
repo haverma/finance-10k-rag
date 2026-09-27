@@ -60,6 +60,27 @@ def read_local_filing(path: str | Path) -> str:
         soup = BeautifulSoup(filing_path.read_text(encoding="utf-8", errors="replace"), "html.parser")
         for node in soup(["script", "style", "noscript", "svg"]):
             node.decompose()
+        # Convert HTML tables to compact pipe-delimited rows so financial
+        # data keeps its column structure for the LLM.
+        for table in soup.find_all("table"):
+            rows: list[str] = []
+            for tr in table.find_all("tr"):
+                cells = [td.get_text(strip=True) for td in tr.find_all(["td", "th"])]
+                # Drop empty cells and merge standalone "$" with next value
+                merged: list[str] = []
+                for cell in cells:
+                    if not cell:
+                        continue
+                    if cell in ("$", "(") and merged:
+                        # Will be merged with the next non-empty cell
+                        merged.append(cell)
+                    elif merged and merged[-1] in ("$", "("):
+                        merged[-1] = merged[-1] + cell
+                    else:
+                        merged.append(cell)
+                if merged:
+                    rows.append(" | ".join(merged))
+            table.replace_with(soup.new_string("\n".join(rows) + "\n"))
         text = soup.get_text("\n")
     else:
         raise ValueError(f"Expected a PDF or HTML filing, got: {filing_path.suffix}")
@@ -142,7 +163,7 @@ def _chunk_section(section: str, start_offset: int, text: str, chunk_size: int, 
     return chunks
 
 
-def chunk_text(text: str, chunk_size: int = 1_200, overlap: int = 150) -> list[TextChunk]:
+def chunk_text(text: str, chunk_size: int = 1_500, overlap: int = 300) -> list[TextChunk]:
     """Create overlapping, section-aware chunks suitable for retrieval."""
     if chunk_size <= 0 or overlap < 0 or overlap >= chunk_size:
         raise ValueError("chunk_size must be positive and overlap must be between 0 and chunk_size.")
